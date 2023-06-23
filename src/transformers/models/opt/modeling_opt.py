@@ -562,14 +562,6 @@ class OPTDecoder(OPTPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-        if hasattr(config, 'kv_offload'):
-            self.kv_offload = self.config.kv_offload
-        else:
-            self.kv_offload = False
-        if hasattr(config, 'max_new_tokens'):
-            self.max_new_tokens = self.config.max_new_tokens
-        else:
-            self.max_new_tokens = None
         self.past_key_values_buffer = None
         self.num_heads = config.num_attention_heads
         self.hidden_dim_per_head = config.hidden_size // config.num_attention_heads
@@ -612,6 +604,8 @@ class OPTDecoder(OPTPreTrainedModel):
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
+        kv_offload: Optional[bool] = None,
+        max_new_tokens: Optional[int] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
@@ -664,7 +658,7 @@ class OPTDecoder(OPTPreTrainedModel):
                 Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
         """
         is_decoding_stage = past_key_values is not None
-        kv_offload = self.config.kv_offload
+
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -723,8 +717,8 @@ class OPTDecoder(OPTPreTrainedModel):
         next_decoder_cache = () if use_cache else None
         if kv_offload and not is_decoding_stage:
             batch_size, prompt_len, hidden_dim = hidden_states.shape
-            assert self.max_new_tokens, '"max_new_tokens is not set in the model config when kv_offload is True'
-            max_len = prompt_len + self.max_new_tokens - 1
+            assert max_new_tokens, '"max_new_tokens is not set when kv_offload is True'
+            max_len = prompt_len + max_new_tokens - 1
             buffer_shape = [len(self.layers), 2, batch_size, self.num_heads, max_len, self.hidden_dim_per_head] # for [k_states, v_states] per layer in order
             if self.past_key_values_buffer is not None:
                 del self.past_key_values_buffer
@@ -1002,6 +996,12 @@ class OPTForCausalLM(OPTPreTrainedModel):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious. I'm just a little bit of a weirdo."
         ```"""
+        kv_offload = False
+        if hasattr(self.config, 'kv_offload'):
+            kv_offload = self.config.kv_offload
+        max_new_tokens = None
+        if hasattr(self.config, 'max_new_tokens'):
+            max_new_tokens = self.config.max_new_tokens
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1017,6 +1017,8 @@ class OPTForCausalLM(OPTPreTrainedModel):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
+            kv_offload=kv_offload,
+            max_new_tokens=max_new_tokens,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
