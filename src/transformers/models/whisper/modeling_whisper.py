@@ -15,7 +15,6 @@
 """ PyTorch Whisper model."""
 
 import math
-import random
 from typing import Optional, Tuple, Union
 
 import numpy as np
@@ -916,8 +915,13 @@ class WhisperEncoder(WhisperPreTrainedModel):
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
             # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
-            dropout_probability = random.uniform(0, 1)
-            if self.training and (dropout_probability < self.layerdrop):  # skip the layer
+            to_drop = False
+            if self.training:
+                dropout_probability = torch.rand([])
+                if dropout_probability < self.layerdrop:  # skip the layer
+                    to_drop = True
+
+            if to_drop:
                 layer_outputs = (None, None)
             else:
                 if self.gradient_checkpointing and self.training:
@@ -1145,9 +1149,10 @@ class WhisperDecoder(WhisperPreTrainedModel):
             # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
-            dropout_probability = random.uniform(0, 1)
-            if self.training and (dropout_probability < self.layerdrop):
-                continue
+            if self.training:
+                dropout_probability = torch.rand([])
+                if dropout_probability < self.layerdrop:
+                    continue
 
             past_key_value = past_key_values[idx] if past_key_values is not None else None
 
@@ -1220,8 +1225,6 @@ class WhisperDecoder(WhisperPreTrainedModel):
     WHISPER_START_DOCSTRING,
 )
 class WhisperModel(WhisperPreTrainedModel):
-    _keys_to_ignore_on_load_missing = [r"proj_out.weight"]
-
     def __init__(self, config: WhisperConfig):
         super().__init__(config)
 
@@ -1391,14 +1394,6 @@ class WhisperModel(WhisperPreTrainedModel):
 )
 class WhisperForConditionalGeneration(WhisperPreTrainedModel):
     base_model_prefix = "model"
-    _keys_to_ignore_on_load_missing = [
-        r"encoder.version",
-        r"decoder.version",
-        r"proj_out.weight",
-    ]
-    _keys_to_ignore_on_save = [
-        r"proj_out.weight",
-    ]
     _tied_weights_keys = ["proj_out.weight"]
 
     def __init__(self, config: WhisperConfig):
