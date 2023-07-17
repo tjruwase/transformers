@@ -135,7 +135,7 @@ def dropout_add(x: torch.Tensor, residual: torch.Tensor, prob: float, training: 
         x (`torch.tensor`, *required*):
             input tensor
         residual (`torch.tensor`, *required*):
-            esidual tensor
+            residual tensor
         prob (`float`, *required*):
             dropout probability
         training (`bool`, *required*):
@@ -254,7 +254,7 @@ class BloomAttention(nn.Module):
 
     def _merge_heads(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Merge heads together over the last dimenstion
+        Merge heads together over the last dimension
 
         Args:
             x (`torch.tensor`, *required*): [batch_size * num_heads, seq_length, head_dim]
@@ -380,7 +380,7 @@ class BloomAttention(nn.Module):
         # matmul: [batch_size * num_heads, q_length, head_dim]
         context_layer = torch.bmm(attention_probs_reshaped, value_layer)
 
-        # change view [batch_size, num_heads, q_length, head_dim]
+        # change view [batch_size, q_length, num_heads * head_dim]
         context_layer = self._merge_heads(context_layer)
 
         if kv_offload:

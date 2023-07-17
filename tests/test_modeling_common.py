@@ -2206,7 +2206,7 @@ class ModelTesterMixin:
                 }
 
                 # convert inputs to Flax
-                fx_inputs = {k: np.array(v) for k, v in pt_inputs.items() if torch.is_tensor(v)}
+                fx_inputs = {k: np.array(v.to("cpu")) for k, v in pt_inputs.items() if torch.is_tensor(v)}
 
                 fx_state = convert_pytorch_state_dict_to_flax(pt_model.state_dict(), fx_model)
                 fx_model.params = fx_state
@@ -2278,7 +2278,7 @@ class ModelTesterMixin:
                 }
 
                 # convert inputs to Flax
-                fx_inputs = {k: np.array(v) for k, v in pt_inputs.items() if torch.is_tensor(v)}
+                fx_inputs = {k: np.array(v.to("cpu")) for k, v in pt_inputs.items() if torch.is_tensor(v)}
 
                 pt_model = load_flax_weights_in_pytorch_model(pt_model, fx_model.params)
 
@@ -2704,6 +2704,18 @@ class ModelTesterMixin:
                         new_model_without_prefix(input_ids, decoder_input_ids=input_ids)
                     else:
                         new_model_without_prefix(input_ids)
+
+    def test_model_is_small(self):
+        # Just a consistency check to make sure we are not running tests on 80M parameter models.
+        config, _ = self.model_tester.prepare_config_and_inputs_for_common()
+        # print(config)
+
+        for model_class in self.all_model_classes:
+            model = model_class(config)
+            num_params = model.num_parameters()
+            assert (
+                num_params < 1000000
+            ), f"{model_class} is too big for the common tests ({num_params})! It should have 200k max."
 
 
 global_rng = random.Random()
