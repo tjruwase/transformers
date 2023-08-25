@@ -209,7 +209,7 @@ class BloomGelu(nn.Module):
 
 
 class BloomAttention(nn.Module):
-    def __init__(self, config: BloomConfig):
+    def __init__(self, config: BloomConfig, store_cache_stream: torch.cuda.Stream = None):
         super().__init__()
 
         self.pretraining_tp = config.pretraining_tp
@@ -234,6 +234,7 @@ class BloomAttention(nn.Module):
         self.query_key_value = nn.Linear(self.hidden_size, 3 * self.hidden_size, bias=True)
         self.dense = nn.Linear(self.hidden_size, self.hidden_size)
         self.attention_dropout = nn.Dropout(config.attention_dropout)
+        self.store_cache_stream = store_cache_stream
 
     def _split_heads(self, fused_qkv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -285,9 +286,12 @@ class BloomAttention(nn.Module):
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         head_mask: Optional[torch.Tensor] = None,
         use_cache: bool = False,
+        kv_offload: Optional[bool] = False,
+        is_decoding_stage: bool = False,
         output_attentions: bool = False,
     ):
         fused_qkv = self.query_key_value(hidden_states)  # [batch_size, seq_length, 3 x hidden_size]
+        bsz, tgt_len, hidden_dim = hidden_states.size()
 
         # 3 x [batch_size, seq_length, num_heads, head_dim]
         (query_layer, key_layer, value_layer) = self._split_heads(fused_qkv)
@@ -297,20 +301,48 @@ class BloomAttention(nn.Module):
         query_layer = query_layer.transpose(1, 2).reshape(batch_size * self.num_heads, q_length, self.head_dim)
         key_layer = key_layer.permute(0, 2, 3, 1).reshape(batch_size * self.num_heads, self.head_dim, q_length)
         value_layer = value_layer.transpose(1, 2).reshape(batch_size * self.num_heads, q_length, self.head_dim)
-        if layer_past is not None:
-            past_key, past_value = layer_past
-            # concatenate along seq_length dimension:
-            #  - key: [batch_size * self.num_heads, head_dim, kv_length]
-            #  - value: [batch_size * self.num_heads, kv_length, head_dim]
-            key_layer = torch.cat((past_key, key_layer), dim=2)
-            value_layer = torch.cat((past_value, value_layer), dim=1)
+
+        if is_decoding_stage:
+            if kv_offload:
+                seq_len = layer_past[0].shape[-1]
+                bh, hh, _  = key_layer.shape
+                key_dst_indices = (slice(0, bh), slice(0, hh), slice(seq_len-tgt_len, seq_len))
+                key_src_indices = (slice(0, bh), slice(0, hh), slice(0, tgt_len))
+                value_dst_indices = (slice(0, bh), slice(seq_len-tgt_len, seq_len), slice(0, hh))
+                value_src_indices = (slice(0, bh), slice(0, tgt_len), slice(0, hh))
+                layer_past[0][key_dst_indices].copy_(key_layer[key_src_indices])
+                layer_past[1][value_dst_indices].copy_(value_layer[value_src_indices])
+                key_layer, value_layer = layer_past[0], layer_past[1]
+            else:
+                past_key, past_value = layer_past
+                # concatenate along seq_length dimension:
+                #  - key: [batch_size * self.num_heads, head_dim, kv_length]
+                #  - value: [batch_size * self.num_heads, kv_length, head_dim]
+                key_layer = torch.cat((past_key, key_layer), dim=2)
+                value_layer = torch.cat((past_value, value_layer), dim=1)
+
+        if use_cache is True:
+            if kv_offload and (not is_decoding_stage):
+                self.store_cache_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self.store_cache_stream):
+                    bh, hh, s  = key_layer.shape
+                    key_dst_indices = (slice(0, bh), slice(0, hh), slice(0, s))
+                    value_dst_indices = (slice(0, bh), slice(0, s), slice(0, hh))
+                    layer_past[0][key_dst_indices].copy_(key_layer, non_blocking=True)
+                    layer_past[1][value_dst_indices].copy_(value_layer, non_blocking=True)
+                    present = (layer_past[0][key_dst_indices], layer_past[1][value_dst_indices])
+            else:
+                present = (key_layer, value_layer)
+        else:
+            present = None
 
         _, _, kv_length = key_layer.shape
 
-        if use_cache is True:
-            present = (key_layer, value_layer)
-        else:
-            present = None
+        if kv_offload and is_decoding_stage:
+            query_layer = query_layer.float().to('cpu')
+            alibi = alibi.float().to('cpu')
+            key_layer = key_layer.float()
+            value_layer = value_layer.float()
 
         # [batch_size * num_heads, q_length, kv_length]
         # we use `torch.Tensor.baddbmm` instead of `torch.baddbmm` as the latter isn't supported by TorchScript v1.11
@@ -325,12 +357,16 @@ class BloomAttention(nn.Module):
         attention_scores = matmul_result.view(batch_size, self.num_heads, q_length, kv_length)
 
         # cast attention scores to fp32, compute scaled softmax and cast back to initial dtype - [batch_size, num_heads, q_length, kv_length]
-        input_dtype = attention_scores.dtype
+        input_dtype = hidden_states.dtype
         # `float16` has a minimum value of -65504.0, whereas `bfloat16` and `float32` have a minimum value of `-3.4e+38`
         if input_dtype == torch.float16:
             attention_scores = attention_scores.to(torch.float)
+        if is_decoding_stage and kv_offload:
+            attention_mask = attention_mask.to('cpu')
         attn_weights = torch.masked_fill(attention_scores, attention_mask, torch.finfo(attention_scores.dtype).min)
-        attention_probs = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(input_dtype)
+        attention_probs = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
+        if not (kv_offload and is_decoding_stage):
+            attention_probs = attention_probs.to(input_dtype)
 
         # [batch_size, num_heads, q_length, kv_length]
         attention_probs = self.attention_dropout(attention_probs)
@@ -346,6 +382,9 @@ class BloomAttention(nn.Module):
 
         # change view [batch_size, q_length, num_heads * head_dim]
         context_layer = self._merge_heads(context_layer)
+
+        if kv_offload:
+            context_layer = context_layer.to(hidden_states.device).to(input_dtype)
 
         # aggregate results across tp ranks. See here: https://github.com/pytorch/pytorch/issues/76232
         if self.pretraining_tp > 1 and self.slow_but_exact:
@@ -364,6 +403,9 @@ class BloomAttention(nn.Module):
         outputs = (output_tensor, present)
         if output_attentions:
             outputs += (attention_probs,)
+
+        if kv_offload:
+            torch.cuda.current_stream().wait_stream(self.store_cache_stream)
 
         return outputs
 
@@ -400,13 +442,13 @@ class BloomMLP(nn.Module):
 
 
 class BloomBlock(nn.Module):
-    def __init__(self, config: BloomConfig):
+    def __init__(self, config: BloomConfig, store_cache_stream: torch.cuda.Stream = None):
         super().__init__()
         hidden_size = config.hidden_size
 
         self.input_layernorm = LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
         self.num_heads = config.n_head
-        self.self_attention = BloomAttention(config)
+        self.self_attention = BloomAttention(config, store_cache_stream=store_cache_stream)
         self.post_attention_layernorm = LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
 
         self.mlp = BloomMLP(config)
@@ -422,6 +464,8 @@ class BloomBlock(nn.Module):
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         head_mask: Optional[torch.Tensor] = None,
         use_cache: bool = False,
+        kv_offload: bool = False,
+        is_decoding_stage: Optional[bool] = False,
         output_attentions: bool = False,
     ):
         # hidden_states: [batch_size, seq_length, hidden_size]
@@ -444,6 +488,8 @@ class BloomBlock(nn.Module):
             alibi=alibi,
             head_mask=head_mask,
             use_cache=use_cache,
+            kv_offload=kv_offload,
+            is_decoding_stage=is_decoding_stage,
             output_attentions=output_attentions,
         )
 
@@ -625,8 +671,10 @@ class BloomModel(BloomPreTrainedModel):
         self.word_embeddings = nn.Embedding(config.vocab_size, self.embed_dim)
         self.word_embeddings_layernorm = LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
 
+        self.store_cache_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+
         # Transformer blocks
-        self.h = nn.ModuleList([BloomBlock(config) for _ in range(config.num_hidden_layers)])
+        self.h = nn.ModuleList([BloomBlock(config, self.store_cache_stream) for _ in range(config.num_hidden_layers)])
 
         # Final Layer Norm
         self.ln_f = LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
@@ -635,6 +683,11 @@ class BloomModel(BloomPreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
+
+        self.past_keys_buffer = None
+        self.past_values_buffer = None
+        self.num_heads = config.num_attention_heads
+        self.hidden_dim_per_head = config.hidden_size // config.num_attention_heads
 
     def build_alibi_tensor(self, attention_mask: torch.Tensor, num_heads: int, dtype: torch.dtype) -> torch.Tensor:
         return build_alibi_tensor(attention_mask, num_heads, dtype)
@@ -681,11 +734,15 @@ class BloomModel(BloomPreTrainedModel):
         head_mask: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
+        kv_offload: Optional[bool] = False,
+        max_new_tokens: Optional[int] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         **deprecated_arguments,
     ) -> Union[Tuple[torch.Tensor, ...], BaseModelOutputWithPastAndCrossAttentions]:
+        is_decoding_stage = past_key_values is not None
+
         if deprecated_arguments.pop("position_ids", False) is not False:
             # `position_ids` could have been `torch.Tensor` or `None` so defaulting pop to `False` allows to detect if users were passing explicitly `None`
             warnings.warn(
@@ -730,6 +787,20 @@ class BloomModel(BloomPreTrainedModel):
         all_self_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
 
+        if kv_offload and not is_decoding_stage:
+            batch_size, prompt_len, hidden_dim = hidden_states.shape
+            max_len = prompt_len + max_new_tokens - 1
+            assert max_new_tokens, 'max_new_tokens not set when kv_offload is True'
+            key_buffer_shape = [len(self.h), batch_size * self.num_heads, self.hidden_dim_per_head, max_len] # for [k_states, v_states] per layer in order
+            if self.past_keys_buffer is not None:
+                del self.past_keys_buffer
+            self.past_keys_buffer = torch.empty(key_buffer_shape, pin_memory=False, dtype=hidden_states.dtype)
+
+            value_buffer_shape = [len(self.h), batch_size * self.num_heads, max_len, self.hidden_dim_per_head] # foror [k_states, v_states] per layer in order
+            if self.past_values_buffer is not None:
+                del self.past_values_buffer
+            self.past_values_buffer = torch.empty(value_buffer_shape, pin_memory=False, dtype=hidden_states.dtype)
+
         if self.gradient_checkpointing and self.training:
             if use_cache:
                 logger.warning_once(
@@ -756,9 +827,20 @@ class BloomModel(BloomPreTrainedModel):
             past_key_values_length=past_key_values_length,
         )
 
-        for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
+        for i, block in enumerate(self.h):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
+
+            if kv_offload:
+                seq_len = past_key_values_length
+                bsz, tgt_len, hidden_dim = hidden_states.shape
+                key_indices = (slice(0, bsz * self.num_heads), slice(0,self.hidden_dim_per_head), slice(0, seq_len+tgt_len))
+                value_indices = (slice(0, bsz * self.num_heads), slice(0, seq_len+tgt_len), slice(0, self.hidden_dim_per_head))
+                layer_past_key = self.past_keys_buffer[i][key_indices]
+                layer_past_value = self.past_values_buffer[i][value_indices]
+                layer_past = (layer_past_key, layer_past_value)
+            else:
+                layer_past = past_key_values[i] if past_key_values is not None else None
 
             if self.gradient_checkpointing and self.training:
 
@@ -784,6 +866,8 @@ class BloomModel(BloomPreTrainedModel):
                     attention_mask=causal_mask,
                     head_mask=head_mask[i],
                     use_cache=use_cache,
+                    kv_offload=kv_offload,
+                    is_decoding_stage=is_decoding_stage,
                     output_attentions=output_attentions,
                     alibi=alibi,
                 )
@@ -893,6 +977,12 @@ class BloomForCausalLM(BloomPreTrainedModel):
             `labels = input_ids` Indices are selected in `[-100, 0, ..., config.vocab_size]` All labels set to `-100`
             are ignored (masked), the loss is only computed for labels in `[0, ..., config.vocab_size]`
         """
+        kv_offload = False
+        if hasattr(self.config, 'kv_offload'):
+            kv_offload = self.config.kv_offload
+        max_new_tokens = None
+        if hasattr(self.config, 'max_new_tokens'):
+            max_new_tokens = self.config.max_new_tokens
         if deprecated_arguments.pop("position_ids", False) is not False:
             # `position_ids` could have been `torch.Tensor` or `None` so defaulting pop to `False` allows to detect if users were passing explicitly `None`
             warnings.warn(
@@ -912,6 +1002,8 @@ class BloomForCausalLM(BloomPreTrainedModel):
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
+            kv_offload=kv_offload,
+            max_new_tokens=max_new_tokens,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,

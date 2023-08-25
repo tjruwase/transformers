@@ -129,6 +129,7 @@ class OPTAttention(nn.Module):
         dropout: float = 0.0,
         is_decoder: bool = False,
         bias: bool = True,
+        store_cache_stream: torch.cuda.Stream = None,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -148,6 +149,7 @@ class OPTAttention(nn.Module):
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.store_cache_stream = store_cache_stream
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -157,6 +159,8 @@ class OPTAttention(nn.Module):
         hidden_states: torch.Tensor,
         key_value_states: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        kv_offload: Optional[bool] = False,
+        is_decoding_stage: bool = False,
         attention_mask: Optional[torch.Tensor] = None,
         layer_head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
@@ -172,7 +176,7 @@ class OPTAttention(nn.Module):
         # get query proj
         query_states = self.q_proj(hidden_states) * self.scaling
         # get key, value proj
-        if is_cross_attention and past_key_value is not None:
+        if is_cross_attention and is_decoding_stage:
             # reuse k,v, cross_attentions
             key_states = past_key_value[0]
             value_states = past_key_value[1]
@@ -180,12 +184,21 @@ class OPTAttention(nn.Module):
             # cross_attentions
             key_states = self._shape(self.k_proj(key_value_states), -1, bsz)
             value_states = self._shape(self.v_proj(key_value_states), -1, bsz)
-        elif past_key_value is not None:
+        elif is_decoding_stage:
             # reuse k, v, self_attention
             key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
             value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
-            key_states = torch.cat([past_key_value[0], key_states], dim=2)
-            value_states = torch.cat([past_key_value[1], value_states], dim=2)
+            if kv_offload:
+                seq_len = past_key_value.shape[3]
+                _, h, _, hh  = key_states.shape
+                dst_indices = (slice(0, bsz), slice(0, h), slice(seq_len-tgt_len, seq_len), slice(0, hh))
+                src_indices = (slice(0, bsz), slice(0, h), slice(0, tgt_len), slice(0, hh))
+                past_key_value[0][dst_indices].copy_(key_states[src_indices])
+                past_key_value[1][dst_indices].copy_(value_states[src_indices])
+                key_states, value_states = past_key_value[0], past_key_value[1]
+            else:
+                key_states = torch.cat([past_key_value[0], key_states], dim=2)
+                value_states = torch.cat([past_key_value[1], value_states], dim=2)
         else:
             # self_attention
             key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
@@ -199,12 +212,23 @@ class OPTAttention(nn.Module):
             # all previous decoder key/value_states. Further calls to uni-directional self-attention
             # can concat previous decoder key/value_states to current projected key/value_states (third "elif" case)
             # if encoder bi-directional self-attention `past_key_value` is always `None`
-            past_key_value = (key_states, value_states)
+            if kv_offload and (not is_decoding_stage):
+                self.store_cache_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self.store_cache_stream):
+                    b, s, h, hh  = key_states.shape
+                    dst_indices = (slice(0, b), slice(0, s), slice(0, h), slice(0, hh))
+                    past_key_value[0][dst_indices].copy_(key_states, non_blocking=True)
+                    past_key_value[1][dst_indices].copy_(value_states, non_blocking=True)
+                    past_key_value = (past_key_value[0][dst_indices], past_key_value[1][dst_indices])
+            else:
+                past_key_value = (key_states, value_states)
 
         proj_shape = (bsz * self.num_heads, -1, self.head_dim)
         query_states = self._shape(query_states, tgt_len, bsz).view(*proj_shape)
         key_states = key_states.view(*proj_shape)
         value_states = value_states.view(*proj_shape)
+        if kv_offload and is_decoding_stage:
+            query_states = query_states.float().to('cpu')
 
         src_len = key_states.size(1)
         attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
@@ -220,6 +244,8 @@ class OPTAttention(nn.Module):
                 raise ValueError(
                     f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)}, but is {attention_mask.size()}"
                 )
+            if is_decoding_stage and kv_offload:
+                attention_mask = attention_mask.to('cpu')
             attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len) + attention_mask
             attn_weights = torch.max(
                 attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min, device=attn_weights.device)
@@ -253,7 +279,9 @@ class OPTAttention(nn.Module):
 
         attn_probs = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
 
-        attn_output = torch.bmm(attn_probs, value_states)
+        attn_output = torch.bmm(attn_probs, value_states).to(hidden_states.dtype)
+        if kv_offload:
+            attn_output = attn_output.to(hidden_states.device)
 
         if attn_output.size() != (bsz * self.num_heads, tgt_len, self.head_dim):
             raise ValueError(
@@ -270,11 +298,14 @@ class OPTAttention(nn.Module):
 
         attn_output = self.out_proj(attn_output)
 
+        if kv_offload:
+            torch.cuda.current_stream().wait_stream(self.store_cache_stream)
+
         return attn_output, attn_weights_reshaped, past_key_value
 
 
 class OPTDecoderLayer(nn.Module):
-    def __init__(self, config: OPTConfig):
+    def __init__(self, config: OPTConfig, store_cache_stream: torch.cuda.Stream = None):
         super().__init__()
         self.embed_dim = config.hidden_size
         self.self_attn = OPTAttention(
@@ -283,6 +314,7 @@ class OPTDecoderLayer(nn.Module):
             dropout=config.attention_dropout,
             is_decoder=True,
             bias=config.enable_bias,
+            store_cache_stream=store_cache_stream,
         )
         self.do_layer_norm_before = config.do_layer_norm_before
         self.dropout = config.dropout
@@ -303,6 +335,8 @@ class OPTDecoderLayer(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
+        kv_offload: Optional[bool] = False,
+        is_decoding_stage: Optional[bool] = False,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
         Args:
@@ -333,6 +367,8 @@ class OPTDecoderLayer(nn.Module):
             attention_mask=attention_mask,
             layer_head_mask=layer_head_mask,
             output_attentions=output_attentions,
+            kv_offload=kv_offload,
+            is_decoding_stage=is_decoding_stage,
         )
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = residual + hidden_states
@@ -517,11 +553,16 @@ class OPTDecoder(OPTPreTrainedModel):
         else:
             self.final_layer_norm = None
 
-        self.layers = nn.ModuleList([OPTDecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.store_cache_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        self.layers = nn.ModuleList([OPTDecoderLayer(config, self.store_cache_stream) for _ in range(config.num_hidden_layers)])
 
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
         self.post_init()
+
+        self.past_key_values_buffer = None
+        self.num_heads = config.num_attention_heads
+        self.hidden_dim_per_head = config.hidden_size // config.num_attention_heads
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -561,6 +602,8 @@ class OPTDecoder(OPTPreTrainedModel):
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
+        kv_offload: Optional[bool] = None,
+        max_new_tokens: Optional[int] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
@@ -612,6 +655,7 @@ class OPTDecoder(OPTPreTrainedModel):
             return_dict (`bool`, *optional*):
                 Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
         """
+        is_decoding_stage = past_key_values is not None
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -668,6 +712,14 @@ class OPTDecoder(OPTPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
+        if kv_offload and not is_decoding_stage:
+            batch_size, prompt_len, hidden_dim = hidden_states.shape
+            assert max_new_tokens, '"max_new_tokens is not set when kv_offload is True'
+            max_len = prompt_len + max_new_tokens - 1
+            buffer_shape = [len(self.layers), 2, batch_size, self.num_heads, max_len, self.hidden_dim_per_head] # for [k_states, v_states] per layer in order
+            if self.past_key_values_buffer is not None:
+                del self.past_key_values_buffer
+            self.past_key_values_buffer = torch.empty(buffer_shape, pin_memory=False)
 
         # check if head_mask has a correct number of layers specified if desired
         for attn_mask, mask_name in zip([head_mask], ["head_mask"]):
@@ -688,7 +740,13 @@ class OPTDecoder(OPTPreTrainedModel):
                 if dropout_probability < self.layerdrop:
                     continue
 
-            past_key_value = past_key_values[idx] if past_key_values is not None else None
+            if kv_offload:
+                seq_len = past_key_values_length
+                bsz, tgt_len, hidden_dim = hidden_states.shape
+                indices = (slice(0, 2), slice(0, bsz), slice(0, self.num_heads), slice(0, seq_len+tgt_len), slice(0, self.hidden_dim_per_head))
+                past_key_value = self.past_key_values_buffer[idx][indices]
+            else:
+                past_key_value = past_key_values[idx] if past_key_values is not None else None
 
             if self.gradient_checkpointing and self.training:
 
@@ -712,6 +770,8 @@ class OPTDecoder(OPTPreTrainedModel):
                     attention_mask=causal_attention_mask,
                     layer_head_mask=(head_mask[idx] if head_mask is not None else None),
                     past_key_value=past_key_value,
+                    kv_offload=kv_offload,
+                    is_decoding_stage=is_decoding_stage,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                 )
@@ -933,6 +993,12 @@ class OPTForCausalLM(OPTPreTrainedModel):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious. I'm just a little bit of a weirdo."
         ```"""
+        kv_offload = False
+        if hasattr(self.config, 'kv_offload'):
+            kv_offload = self.config.kv_offload
+        max_new_tokens = None
+        if hasattr(self.config, 'max_new_tokens'):
+            max_new_tokens = self.config.max_new_tokens
 
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -948,6 +1014,8 @@ class OPTForCausalLM(OPTPreTrainedModel):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
+            kv_offload=kv_offload,
+            max_new_tokens=max_new_tokens,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
