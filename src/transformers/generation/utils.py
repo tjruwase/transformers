@@ -2432,6 +2432,8 @@ class GenerationMixin:
         unfinished_sequences = torch.ones(input_ids.shape[0], dtype=torch.long, device=input_ids.device)
 
         this_peer_finished = False  # used by synced_gpus only
+        import time 
+        token_latency = []
         while True:
             if synced_gpus:
                 # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
@@ -2445,7 +2447,8 @@ class GenerationMixin:
 
             # prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
-
+            torch.cuda.synchronize()
+            t0 = time.time()
             # forward pass to get next token
             outputs = self(
                 **model_inputs,
@@ -2453,6 +2456,8 @@ class GenerationMixin:
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
             )
+            torch.cuda.synchronize()
+            token_latency.append(time.time() - t0)
 
             if synced_gpus and this_peer_finished:
                 continue  # don't waste resources running the code we don't need
@@ -2516,6 +2521,8 @@ class GenerationMixin:
 
         if streamer is not None:
             streamer.end()
+        
+        print(f'{token_latency=}')
 
         if return_dict_in_generate:
             if self.config.is_encoder_decoder:

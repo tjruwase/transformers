@@ -235,6 +235,7 @@ class BloomAttention(nn.Module):
         self.dense = nn.Linear(self.hidden_size, self.hidden_size)
         self.attention_dropout = nn.Dropout(config.attention_dropout)
         self.store_cache_stream = store_cache_stream
+        self.async_kv_offload = False 
 
     def _split_heads(self, fused_qkv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -328,8 +329,8 @@ class BloomAttention(nn.Module):
                     bh, hh, s  = key_layer.shape
                     key_dst_indices = (slice(0, bh), slice(0, hh), slice(0, s))
                     value_dst_indices = (slice(0, bh), slice(0, s), slice(0, hh))
-                    layer_past[0][key_dst_indices].copy_(key_layer, non_blocking=True)
-                    layer_past[1][value_dst_indices].copy_(value_layer, non_blocking=True)
+                    layer_past[0][key_dst_indices].copy_(key_layer, non_blocking=self.async_kv_offload)
+                    layer_past[1][value_dst_indices].copy_(value_layer, non_blocking=self.async_kv_offload)
                     present = (layer_past[0][key_dst_indices], layer_past[1][value_dst_indices])
             else:
                 present = (key_layer, value_layer)
@@ -688,12 +689,22 @@ class BloomModel(BloomPreTrainedModel):
         self.past_values_buffer = None
         self.num_heads = config.num_attention_heads
         self.hidden_dim_per_head = config.hidden_size // config.num_attention_heads
+        self.kv_cache_offload = False 
+        self.max_new_tokens = None 
+        self.pin_kv_cache = False
 
     def build_alibi_tensor(self, attention_mask: torch.Tensor, num_heads: int, dtype: torch.dtype) -> torch.Tensor:
         return build_alibi_tensor(attention_mask, num_heads, dtype)
 
     def get_input_embeddings(self):
         return self.word_embeddings
+
+    def set_kv_cache_offload(self, enable, max_new_tokens, pin_kv_cache, async_kv_offload):
+        self.kv_cache_offload = enable
+        self.max_new_tokens = max_new_tokens 
+        self.pin_kv_cache = pin_kv_cache
+        for layer in self.h:
+            layer.self_attention.async_kv_offload = async_kv_offload
 
     def _prepare_attn_mask(
         self, attention_mask: torch.Tensor, input_shape: Tuple[int, int], past_key_values_length: int
@@ -734,8 +745,6 @@ class BloomModel(BloomPreTrainedModel):
         head_mask: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
-        kv_offload: Optional[bool] = False,
-        max_new_tokens: Optional[int] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
@@ -787,19 +796,19 @@ class BloomModel(BloomPreTrainedModel):
         all_self_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
 
-        if kv_offload and not is_decoding_stage:
+        if self.kv_cache_offload and not is_decoding_stage:
+            assert self.max_new_tokens, 'max_new_tokens not set when kv_offload is True'
             batch_size, prompt_len, hidden_dim = hidden_states.shape
-            max_len = prompt_len + max_new_tokens - 1
-            assert max_new_tokens, 'max_new_tokens not set when kv_offload is True'
+            max_len = prompt_len + self.max_new_tokens - 1
             key_buffer_shape = [len(self.h), batch_size * self.num_heads, self.hidden_dim_per_head, max_len] # for [k_states, v_states] per layer in order
             if self.past_keys_buffer is not None:
                 del self.past_keys_buffer
-            self.past_keys_buffer = torch.empty(key_buffer_shape, pin_memory=False, dtype=hidden_states.dtype)
+            self.past_keys_buffer = torch.empty(key_buffer_shape, pin_memory=self.pin_kv_cache, dtype=hidden_states.dtype)
 
             value_buffer_shape = [len(self.h), batch_size * self.num_heads, max_len, self.hidden_dim_per_head] # foror [k_states, v_states] per layer in order
             if self.past_values_buffer is not None:
                 del self.past_values_buffer
-            self.past_values_buffer = torch.empty(value_buffer_shape, pin_memory=False, dtype=hidden_states.dtype)
+            self.past_values_buffer = torch.empty(value_buffer_shape, pin_memory=self.pin_kv_cache, dtype=hidden_states.dtype)
 
         if self.gradient_checkpointing and self.training:
             if use_cache:
@@ -831,7 +840,7 @@ class BloomModel(BloomPreTrainedModel):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
-            if kv_offload:
+            if self.kv_cache_offload:
                 seq_len = past_key_values_length
                 bsz, tgt_len, hidden_dim = hidden_states.shape
                 key_indices = (slice(0, bsz * self.num_heads), slice(0,self.hidden_dim_per_head), slice(0, seq_len+tgt_len))
@@ -866,7 +875,7 @@ class BloomModel(BloomPreTrainedModel):
                     attention_mask=causal_mask,
                     head_mask=head_mask[i],
                     use_cache=use_cache,
-                    kv_offload=kv_offload,
+                    kv_offload=self.kv_cache_offload,
                     is_decoding_stage=is_decoding_stage,
                     output_attentions=output_attentions,
                     alibi=alibi,
@@ -919,6 +928,9 @@ class BloomForCausalLM(BloomPreTrainedModel):
 
     def set_output_embeddings(self, new_embeddings: torch.Tensor):
         self.lm_head = new_embeddings
+
+    def set_kv_cache_offload(self, enable, max_new_tokens=None, pin_kv_cache=False, async_kv_offload=False):
+        self.transformer.set_kv_cache_offload(enable, max_new_tokens, pin_kv_cache, async_kv_offload)
 
     def prepare_inputs_for_generation(
         self,
@@ -977,12 +989,6 @@ class BloomForCausalLM(BloomPreTrainedModel):
             `labels = input_ids` Indices are selected in `[-100, 0, ..., config.vocab_size]` All labels set to `-100`
             are ignored (masked), the loss is only computed for labels in `[0, ..., config.vocab_size]`
         """
-        kv_offload = False
-        if hasattr(self.config, 'kv_offload'):
-            kv_offload = self.config.kv_offload
-        max_new_tokens = None
-        if hasattr(self.config, 'max_new_tokens'):
-            max_new_tokens = self.config.max_new_tokens
         if deprecated_arguments.pop("position_ids", False) is not False:
             # `position_ids` could have been `torch.Tensor` or `None` so defaulting pop to `False` allows to detect if users were passing explicitly `None`
             warnings.warn(
@@ -1002,8 +1008,6 @@ class BloomForCausalLM(BloomPreTrainedModel):
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
-            kv_offload=kv_offload,
-            max_new_tokens=max_new_tokens,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,

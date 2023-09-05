@@ -150,6 +150,7 @@ class OPTAttention(nn.Module):
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.store_cache_stream = store_cache_stream
+        self.async_kv_offload = False 
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -217,8 +218,8 @@ class OPTAttention(nn.Module):
                 with torch.cuda.stream(self.store_cache_stream):
                     b, s, h, hh  = key_states.shape
                     dst_indices = (slice(0, b), slice(0, s), slice(0, h), slice(0, hh))
-                    past_key_value[0][dst_indices].copy_(key_states, non_blocking=True)
-                    past_key_value[1][dst_indices].copy_(value_states, non_blocking=True)
+                    past_key_value[0][dst_indices].copy_(key_states, non_blocking=self.async_kv_offload)
+                    past_key_value[1][dst_indices].copy_(value_states, non_blocking=self.async_kv_offload)
                     past_key_value = (past_key_value[0][dst_indices], past_key_value[1][dst_indices])
             else:
                 past_key_value = (key_states, value_states)
@@ -563,6 +564,9 @@ class OPTDecoder(OPTPreTrainedModel):
         self.past_key_values_buffer = None
         self.num_heads = config.num_attention_heads
         self.hidden_dim_per_head = config.hidden_size // config.num_attention_heads
+        self.kv_cache_offload = False
+        self.max_new_tokens = None 
+        self.pin_kv_cache = False 
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -570,6 +574,13 @@ class OPTDecoder(OPTPreTrainedModel):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
 
+    def set_kv_cache_offload(self, enable, max_new_tokens, pin_kv_cache, async_kv_offload):
+        self.kv_cache_offload = enable
+        self.max_new_tokens = max_new_tokens
+        self.pin_kv_cache = pin_kv_cache
+        for layer in self.layers:
+            layer.self_attn.async_kv_offload = async_kv_offload
+    
     # Copied from transformers.models.bart.modeling_bart.BartDecoder._prepare_decoder_attention_mask
     def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
         # create causal mask
@@ -602,8 +613,6 @@ class OPTDecoder(OPTPreTrainedModel):
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
-        kv_offload: Optional[bool] = None,
-        max_new_tokens: Optional[int] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
@@ -712,14 +721,14 @@ class OPTDecoder(OPTPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
-        if kv_offload and not is_decoding_stage:
+        if self.kv_cache_offload and not is_decoding_stage:
+            assert self.max_new_tokens, '"max_new_tokens is not set when kv_offload is True'
             batch_size, prompt_len, hidden_dim = hidden_states.shape
-            assert max_new_tokens, '"max_new_tokens is not set when kv_offload is True'
-            max_len = prompt_len + max_new_tokens - 1
+            max_len = prompt_len + self.max_new_tokens - 1
             buffer_shape = [len(self.layers), 2, batch_size, self.num_heads, max_len, self.hidden_dim_per_head] # for [k_states, v_states] per layer in order
             if self.past_key_values_buffer is not None:
                 del self.past_key_values_buffer
-            self.past_key_values_buffer = torch.empty(buffer_shape, pin_memory=False)
+            self.past_key_values_buffer = torch.empty(buffer_shape, pin_memory=self.pin_kv_cache)
 
         # check if head_mask has a correct number of layers specified if desired
         for attn_mask, mask_name in zip([head_mask], ["head_mask"]):
@@ -740,7 +749,7 @@ class OPTDecoder(OPTPreTrainedModel):
                 if dropout_probability < self.layerdrop:
                     continue
 
-            if kv_offload:
+            if self.kv_cache_offload:
                 seq_len = past_key_values_length
                 bsz, tgt_len, hidden_dim = hidden_states.shape
                 indices = (slice(0, 2), slice(0, bsz), slice(0, self.num_heads), slice(0, seq_len+tgt_len), slice(0, self.hidden_dim_per_head))
@@ -770,7 +779,7 @@ class OPTDecoder(OPTPreTrainedModel):
                     attention_mask=causal_attention_mask,
                     layer_head_mask=(head_mask[idx] if head_mask is not None else None),
                     past_key_value=past_key_value,
-                    kv_offload=kv_offload,
+                    kv_offload=self.kv_cache_offload,
                     is_decoding_stage=is_decoding_stage,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
@@ -906,6 +915,10 @@ class OPTForCausalLM(OPTPreTrainedModel):
     def get_decoder(self):
         return self.model.decoder
 
+    def set_kv_cache_offload(self, enable, max_new_tokens = None, pin_kv_cache = False, async_kv_offload = False):
+        self.model.decoder.set_kv_cache_offload(enable, max_new_tokens, pin_kv_cache, async_kv_offload)
+
+
     @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
@@ -993,13 +1006,6 @@ class OPTForCausalLM(OPTPreTrainedModel):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious. I'm just a little bit of a weirdo."
         ```"""
-        kv_offload = False
-        if hasattr(self.config, 'kv_offload'):
-            kv_offload = self.config.kv_offload
-        max_new_tokens = None
-        if hasattr(self.config, 'max_new_tokens'):
-            max_new_tokens = self.config.max_new_tokens
-
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1014,8 +1020,6 @@ class OPTForCausalLM(OPTPreTrainedModel):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
-            kv_offload=kv_offload,
-            max_new_tokens=max_new_tokens,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,

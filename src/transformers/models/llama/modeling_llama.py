@@ -237,7 +237,11 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: LlamaConfig):
+    def __init__(
+        self, 
+        config: LlamaConfig,
+        store_cache_stream: torch.cuda.Stream = None,
+    ):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -246,6 +250,8 @@ class LlamaAttention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
+        self.store_cache_stream = store_cache_stream
+        self.async_kv_offload = False
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
@@ -284,6 +290,8 @@ class LlamaAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        kv_offload: Optional[bool] = False,
+        is_decoding_stage: bool = False,
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
@@ -315,26 +323,57 @@ class LlamaAttention(nn.Module):
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        kv_seq_len = key_states.shape[-2]
-        if past_key_value is not None:
-            kv_seq_len += past_key_value[0].shape[-2]
+        if kv_offload:
+            kv_seq_len = past_key_value[0].shape[-2] if is_decoding_stage else key_states.shape[-2]   
+        else:
+            kv_seq_len = key_states.shape[-2]
+            if is_decoding_stage: # past_key_value is not None:
+                kv_seq_len += past_key_value[0].shape[-2]
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
-        if past_key_value is not None:
+        if is_decoding_stage: # past_key_value is not None:
             # reuse k, v, self_attention
-            key_states = torch.cat([past_key_value[0], key_states], dim=2)
-            value_states = torch.cat([past_key_value[1], value_states], dim=2)
+            # import pdb; pdb.set_trace()
+            if kv_offload:
+                seq_len = past_key_value.shape[3]
+                _, h, _, hh  = key_states.shape
+                dst_indices = (slice(0, bsz), slice(0, h), slice(seq_len-q_len, seq_len), slice(0, hh))
+                src_indices = (slice(0, bsz), slice(0, h), slice(0, q_len), slice(0, hh))
+                past_key_value[0][dst_indices].copy_(key_states[src_indices])
+                past_key_value[1][dst_indices].copy_(value_states[src_indices])
+                key_states, value_states = past_key_value[0], past_key_value[1]
 
-        past_key_value = (key_states, value_states) if use_cache else None
+            else:
+                key_states = torch.cat([past_key_value[0], key_states], dim=2)
+                value_states = torch.cat([past_key_value[1], value_states], dim=2)
+
+        if use_cache:
+            # import pdb; pdb.set_trace()
+            if kv_offload and (not is_decoding_stage):
+                self.store_cache_stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(self.store_cache_stream):
+                    b, s, h, hh  = key_states.shape
+                    dst_indices = (slice(0, b), slice(0, s), slice(0, h), slice(0, hh))
+                    # import pdb; pdb.set_trace()
+                    past_key_value[0][dst_indices].copy_(key_states, non_blocking=self.async_kv_offload)
+                    past_key_value[1][dst_indices].copy_(value_states, non_blocking=self.async_kv_offload)
+                    past_key_value = (past_key_value[0][dst_indices], past_key_value[1][dst_indices])
+            else:
+                past_key_value = (key_states, value_states) 
+        else:
+            past_key_value = None
 
         # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if kv_offload and is_decoding_stage:
+            query_states = query_states.float().to('cpu')
 
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
+            import pdb; pdb.set_trace()
             raise ValueError(
                 f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
                 f" {attn_weights.size()}"
@@ -345,11 +384,15 @@ class LlamaAttention(nn.Module):
                 raise ValueError(
                     f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
                 )
+            if kv_offload and is_decoding_stage:
+                attention_mask = attention_mask.to('cpu')            
             attn_weights = attn_weights + attention_mask
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_output = torch.matmul(attn_weights, value_states)
+        if kv_offload:
+            attn_output = attn_output.to(hidden_states.device).to(hidden_states.dtype)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
@@ -370,14 +413,17 @@ class LlamaAttention(nn.Module):
         if not output_attentions:
             attn_weights = None
 
+        if kv_offload:
+            torch.cuda.current_stream().wait_stream(self.store_cache_stream)
+
         return attn_output, attn_weights, past_key_value
 
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, config: LlamaConfig, store_cache_stream: torch.cuda.Stream = None):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = LlamaAttention(config=config)
+        self.self_attn = LlamaAttention(config=config, store_cache_stream=store_cache_stream)
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -390,6 +436,8 @@ class LlamaDecoderLayer(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
+        kv_offload: Optional[bool] = False,
+        is_decoding_stage: Optional[bool] = False,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
         Args:
@@ -417,6 +465,8 @@ class LlamaDecoderLayer(nn.Module):
             past_key_value=past_key_value,
             output_attentions=output_attentions,
             use_cache=use_cache,
+            kv_offload=kv_offload,
+            is_decoding_stage=is_decoding_stage,
         )
         hidden_states = residual + hidden_states
 
@@ -563,18 +613,36 @@ class LlamaModel(LlamaPreTrainedModel):
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList([LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.store_cache_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        self.layers = nn.ModuleList([LlamaDecoderLayer(config, self.store_cache_stream) for _ in range(config.num_hidden_layers)])
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
         self.post_init()
 
+        self.past_key_values_buffer = None
+        self.num_heads = config.num_attention_heads
+        self.hidden_dim_per_head = config.hidden_size // config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+
+        self.kv_cache_offload = False 
+        self.max_new_tokens = None 
+        self.pin_kv_cache = False 
+
+
     def get_input_embeddings(self):
         return self.embed_tokens
 
     def set_input_embeddings(self, value):
         self.embed_tokens = value
+
+    def set_kv_cache_offload(self, enable, max_new_tokens, pin_kv_cache, async_kv_offload):
+        self.kv_cache_offload = enable 
+        self.max_new_tokens = max_new_tokens
+        self.pin_kv_cache = pin_kv_cache
+        for layer in self.layers:
+            layer.self_attn.async_kv_offload = async_kv_offload
 
     # Copied from transformers.models.bart.modeling_bart.BartDecoder._prepare_decoder_attention_mask
     def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
@@ -613,6 +681,7 @@ class LlamaModel(LlamaPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
+        is_decoding_stage = past_key_values is not None
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -659,7 +728,7 @@ class LlamaModel(LlamaPreTrainedModel):
         )
 
         hidden_states = inputs_embeds
-
+        # import pdb; pdb.set_trace()
         if self.gradient_checkpointing and self.training:
             if use_cache:
                 logger.warning_once(
@@ -671,12 +740,30 @@ class LlamaModel(LlamaPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
+        if self.kv_cache_offload and not is_decoding_stage:
+            batch_size, prompt_len, hidden_dim = hidden_states.shape
+            assert self.max_new_tokens, '"max_new_tokens is not set when kv_offload is True'
+            max_len = prompt_len + self.max_new_tokens - 1
+            buffer_shape = [len(self.layers), 2, batch_size, self.num_key_value_heads, max_len, self.hidden_dim_per_head] # for [k_states, v_states] per layer in order
+            if self.past_key_values_buffer is None:
+                self.past_key_values_buffer = torch.empty(buffer_shape, pin_memory=self.pin_kv_cache)
+            elif buffer_shape != self.past_key_values_buffer.shape:
+                del self.past_key_values_buffer            
+                self.past_key_values_buffer = torch.empty(buffer_shape, pin_memory=self.pin_kv_cache)
+            
+            print(f'{self.past_key_values_buffer.numel()}')
 
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            past_key_value = past_key_values[idx] if past_key_values is not None else None
+            if self.kv_cache_offload:
+                seq_len = past_key_values_length
+                bsz, tgt_len, hidden_dim = hidden_states.shape
+                indices = (slice(0, 2), slice(0, bsz), slice(0, self.num_key_value_heads), slice(0, seq_len+tgt_len), slice(0, self.hidden_dim_per_head))
+                past_key_value = self.past_key_values_buffer[idx][indices]
+            else:
+                past_key_value = past_key_values[idx] if past_key_values is not None else None
 
             if self.gradient_checkpointing and self.training:
 
@@ -699,6 +786,8 @@ class LlamaModel(LlamaPreTrainedModel):
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     past_key_value=past_key_value,
+                    kv_offload=self.kv_cache_offload,
+                    is_decoding_stage=is_decoding_stage,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                 )
@@ -710,6 +799,7 @@ class LlamaModel(LlamaPreTrainedModel):
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
+
 
         hidden_states = self.norm(hidden_states)
 
@@ -758,6 +848,9 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
     def get_decoder(self):
         return self.model
 
+    def set_kv_cache_offload(self, enable, max_new_tokens = None, pin_kv_cache= False, async_kv_offload = False):
+        self.model.set_kv_cache_offload(enable, max_new_tokens, pin_kv_cache, async_kv_offload)
+
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     def forward(
@@ -798,7 +891,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
-
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -806,6 +898,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        # import pdb; pdb.set_trace()
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -843,7 +936,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
-
+        # import pdb; pdb.set_trace()
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
