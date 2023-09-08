@@ -2450,6 +2450,7 @@ class GenerationMixin:
             torch.cuda.synchronize()
             t0 = time.time()
             # forward pass to get next token
+            # print(f'before generation forward pass --------------------------------')
             outputs = self(
                 **model_inputs,
                 return_dict=True,
@@ -2458,6 +2459,7 @@ class GenerationMixin:
             )
             torch.cuda.synchronize()
             token_latency.append(time.time() - t0)
+            # print(f'after generation forward pass --------------------------------')
 
             if synced_gpus and this_peer_finished:
                 continue  # don't waste resources running the code we don't need
